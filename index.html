@@ -83,6 +83,7 @@
     <button class="tab active" data-view="diagnose">Diagnosticar</button>
     <button class="tab" data-view="add">Adicionar caso</button>
     <button class="tab" data-view="history">Histórico</button>
+    <button class="tab" data-view="stats">Estatísticas</button>
   </div>
 
   <div class="panel view active" id="view-diagnose">
@@ -114,6 +115,11 @@
     <div id="histList"></div>
   </div>
 
+  <div class="panel view" id="view-stats">
+    <div class="status" id="statsStatus"></div>
+    <div id="statsBody"></div>
+  </div>
+
 </div>
 
 <script>
@@ -133,6 +139,7 @@
       btn.classList.add('active');
       document.getElementById('view-'+btn.dataset.view).classList.add('active');
       if (btn.dataset.view === 'history') loadHistory();
+      if (btn.dataset.view === 'stats') loadStats();
     });
   });
 
@@ -193,6 +200,17 @@
     return (lines[0] || '').slice(0,300);
   }
 
+  function extractBacktrace(text){
+    const m = text.match(/Backtrace[^\n]*\n([\s\S]{0,4000}?)(?:\n\s*\n|\nKernel Extensions|\nBSD process|\nKernel version|$)/i);
+    if(!m) return [];
+    const lines = m[1].split('\n').map(l=>l.trim()).filter(Boolean);
+    return lines
+      .filter(l => /0x[0-9a-f]{4,}/i.test(l))
+      .map(l => l.replace(/0x[0-9a-f]+/gi, '').replace(/\s+/g,' ').trim())
+      .filter(Boolean)
+      .slice(0, 40);
+  }
+
   function extractFeatures(text){
     const idMatch = text.match(/\biPhone\d{1,2},\d\b/);
     const identifier = idMatch ? idMatch[0] : null;
@@ -208,7 +226,29 @@
     let component = null;
     for(const [re,label] of COMPONENT_RULES){ if(re.test(text)){ component = label; break; } }
 
-    return { device_model, identifier, ios_version: build, panic_type, component, signature: extractSignature(text) };
+    const kMatch = text.match(/Kernel Version:\s*(.+)/i);
+    const kernel_version = kMatch ? kMatch[1].trim().slice(0,200) : null;
+
+    const kextMatch = text.match(/last loaded kext at[^:]*:\s*(.+)/i);
+    const last_kext = kextMatch ? kextMatch[1].trim().slice(0,200) : null;
+
+    const taskMatch = text.match(/Panicked task[^:]*:\s*(.+)/i);
+    const panicked_task = taskMatch ? taskMatch[1].trim().slice(0,200) : null;
+
+    const battMatch = text.match(/[Bb]attery[^\n]{0,60}?(\d{1,3})\s*%/);
+    const chargingMatch = /charging/i.test(text);
+    const battery_info = battMatch ? (battMatch[1] + '%' + (chargingMatch ? ' (carregando)' : '')) : null;
+
+    const wakeMatch = text.match(/Wake reason:\s*(.+)/i);
+    const wake_reason = wakeMatch ? wakeMatch[1].trim().slice(0,100) : null;
+
+    const backtrace_frames = extractBacktrace(text);
+
+    return {
+      device_model, identifier, ios_version: build, panic_type, component,
+      kernel_version, last_kext, panicked_task, battery_info, wake_reason,
+      backtrace_frames, signature: extractSignature(text)
+    };
   }
 
   // ---- add case ----
@@ -220,15 +260,48 @@
     if(!raw || !defect){ setStatus(statusEl, 'Preencha o panic full e o defeito.', 'err'); return; }
 
     const f = extractFeatures(raw);
+
+    // 1) antes de salvar, pergunta ao banco (do jeito que ele está agora) o que ele teria previsto
+    setStatus(statusEl, 'Registrando previsão de controle...', 'busy');
+    let predicted = null;
+    try{
+      const { data: pred } = await client.rpc('match_panic', {
+        query_signature: f.signature, query_raw: raw,
+        query_model: f.device_model, query_panic_type: f.panic_type, query_component: f.component,
+        query_frames: f.backtrace_frames, match_count: 1
+      });
+      if(pred && pred.length){
+        predicted = pred[0];
+        const correct = predicted.defect.trim().toLowerCase() === defect.trim().toLowerCase();
+        await client.from('predictions').insert({
+          predicted_defect: predicted.defect, actual_defect: defect, correct,
+          same_model: predicted.same_model, same_panic_type: predicted.same_panic_type, same_component: predicted.same_component
+        });
+      }
+    }catch(e){ /* segue sem log de previsão se der erro */ }
+
+    // 2) salva o caso
     setStatus(statusEl, 'Salvando...', 'busy');
     const { error } = await client.from('panic_reports').insert({
       raw_panic: raw, signature: f.signature, defect,
       device_model: f.device_model, ios_version: f.ios_version,
-      panic_type: f.panic_type, component: f.component
+      panic_type: f.panic_type, component: f.component,
+      kernel_version: f.kernel_version, last_kext: f.last_kext,
+      panicked_task: f.panicked_task, battery_info: f.battery_info, wake_reason: f.wake_reason,
+      backtrace_frames: f.backtrace_frames
     });
     if(error){ setStatus(statusEl, 'Erro: '+error.message, 'err'); return; }
+
+    // 3) recalibra os pesos com o histórico atualizado
+    try{ await client.rpc('recalibrate_weights'); }catch(e){ /* silencioso */ }
+
     const tag = [f.device_model, f.panic_type, f.component].filter(Boolean).join(' · ');
-    setStatus(statusEl, 'Caso salvo.' + (tag ? ' ('+tag+')' : ''), 'ok');
+    let predMsg = '';
+    if(predicted){
+      const correct = predicted.defect.trim().toLowerCase() === defect.trim().toLowerCase();
+      predMsg = correct ? ' — previsão do sistema acertou ✅' : ` — previsão do sistema era "${predicted.defect}" (errou) ❌`;
+    }
+    setStatus(statusEl, 'Caso salvo.' + (tag ? ' ('+tag+')' : '') + predMsg, 'ok');
     document.getElementById('addInput').value='';
     document.getElementById('addDefect').value='';
   });
@@ -249,7 +322,7 @@
     const { data, error } = await client.rpc('match_panic', {
       query_signature: f.signature, query_raw: raw,
       query_model: f.device_model, query_panic_type: f.panic_type, query_component: f.component,
-      match_count: 8
+      query_frames: f.backtrace_frames, match_count: 8
     });
     if(error){ setStatus(statusEl, 'Erro: '+error.message, 'err'); return; }
 
@@ -323,6 +396,55 @@
         <div class="hist-date">${new Date(r.created_at).toLocaleDateString('pt-BR')}</div>
       </div>
     `).join('');
+  }
+
+  // ---- stats ----
+  function pct(v){ return Math.round((v||0)*100) + '%'; }
+
+  async function loadStats(){
+    if(!configured) return;
+    const statusEl = document.getElementById('statsStatus');
+    const bodyEl = document.getElementById('statsBody');
+    setStatus(statusEl, 'Carregando...', 'busy');
+
+    const [{ data: stats, error: e1 }, { data: weights, error: e2 }] = await Promise.all([
+      client.rpc('get_accuracy_stats'),
+      client.from('weights').select('key, value').order('key')
+    ]);
+    if(e1 || e2){ setStatus(statusEl, 'Erro: '+((e1||e2).message), 'err'); return; }
+
+    const s = (stats && stats[0]) || {};
+    if(!s.total_predictions){
+      setStatus(statusEl, 'Ainda sem previsões registradas.', 'ok');
+      bodyEl.innerHTML = '<div class="empty">As estatísticas aparecem depois que você adicionar casos com pelo menos 1 caso já existente no banco (cada novo caso vira uma previsão de controle).</div>';
+      return;
+    }
+    setStatus(statusEl, s.total_predictions + ' previsão(ões) registradas — recalibra automaticamente a partir de 8', 'ok');
+
+    const rows = [
+      ['Mesmo modelo', s.acc_model_true, s.acc_model_false],
+      ['Mesmo tipo de panic', s.acc_type_true, s.acc_type_false],
+      ['Mesmo componente', s.acc_comp_true, s.acc_comp_false],
+    ];
+
+    bodyEl.innerHTML = `
+      <div class="diagnosis">
+        <div class="dtitle">Taxa de acerto geral: ${pct(s.overall_accuracy)}</div>
+        <div class="dconf">baseado em ${s.total_predictions} previsão(ões) de controle</div>
+      </div>
+      <div class="results">
+        ${rows.map(([label, t, f])=>`
+          <div class="card">
+            <div class="top"><div class="defect">${label}</div></div>
+            <div class="why">Quando batia: <span class="score">${pct(t)}</span> de acerto &nbsp;·&nbsp; Quando não batia: <span class="score">${pct(f)}</span> de acerto</div>
+          </div>
+        `).join('')}
+        <div class="card">
+          <div class="top"><div class="defect">Pesos atuais</div></div>
+          <div class="why">${(weights||[]).map(w=>`${w.key}: ${w.value.toFixed(2)}`).join(' &nbsp;·&nbsp; ')}</div>
+        </div>
+      </div>
+    `;
   }
 </script>
 </body>
